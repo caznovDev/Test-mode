@@ -1,24 +1,19 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
 import yt_dlp
-import os
-import uuid
-import shutil
-import zipfile
-from pathlib import Path
-from typing import List
-import re
 import boto3
-import tempfile
-
+import requests
+import re
+import uuid
+from typing import List, Dict, Any
 
 # ============================================================
 #  FASTAPI + CORS
 # ============================================================
 
-app = FastAPI(title="Rumble Video Downloader API with R2")
+app = FastAPI(title="Rumble → R2 Streamer API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -29,15 +24,7 @@ app.add_middleware(
 )
 
 # ============================================================
-#  WRITABLE TEMP DIRECTORY (Vercel-safe)
-# ============================================================
-
-BASE_TMP_DIR = "/tmp/rumble-api"  # Vercel allows writing here
-os.makedirs(BASE_TMP_DIR, exist_ok=True)
-
-# ============================================================
-#  Cloudflare R2 Config (PLACEHOLDER values provided by you)
-#  Move these to env vars later.
+#  Cloudflare R2 Config (PLACEHOLDERS - move to env later)
 # ============================================================
 
 R2_ACCOUNT_ID = "42d73c812e25ae65e416d5f503b18be4"
@@ -47,7 +34,6 @@ R2_BUCKET = "files"
 R2_S3_ENDPOINT = "https://42d73c812e25ae65e416d5f503b18be4.r2.cloudflarestorage.com"
 R2_PUBLIC_BASE_URL = "https://pub-2088e0ca945a43f996f9d7be86ec3dc5.r2.dev"
 
-# boto3 client for R2
 r2_session = boto3.session.Session()
 s3_client = r2_session.client(
     service_name="s3",
@@ -63,8 +49,8 @@ s3_client = r2_session.client(
 class RumbleRequest(BaseModel):
     page_url: str
 
-    @field_validator('page_url')
-    def check_url(cls, v):
+    @field_validator("page_url")
+    def validate_url(cls, v: str) -> str:
         if not v or not v.strip():
             raise ValueError("page_url must be non-empty")
         pattern = re.compile(
@@ -82,118 +68,143 @@ class RumbleRequest(BaseModel):
 
 
 class RumbleRequestWithLimit(RumbleRequest):
-    max_videos: int = 10
+    # Default small to stay well inside Vercel time limits & no disk use
+    max_videos: int = 3
 
     @field_validator("max_videos")
-    def check_limit(cls, v):
-        if v < 1 or v > 10:
-            raise ValueError("max_videos must be between 1 and 10")
+    def validate_limit(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("max_videos must be at least 1")
+        # Streaming multiple videos still takes time; keep this conservative
+        if v > 5:
+            raise ValueError("max_videos must be <= 5 on this deployment")
         return v
 
-
 # ============================================================
-#  Helpers
+#  yt-dlp Helpers (no download, no cache)
 # ============================================================
 
-def cleanup_temp_files(temp_dir: str, zip_path: str):
-    """Delete temp directory + ZIP after response is sent."""
-    try:
-        if temp_dir and os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir, ignore_errors=True)
-            print(f"✓ Cleaned temp dir: {temp_dir}")
+def extract_page_video_urls(page_url: str, max_videos: int) -> List[str]:
+    """
+    Use yt-dlp in 'flat' mode to get the first N *page* URLs from a Rumble
+    listing page (user/videos, playlist, etc.).
+    """
+    print(f"→ Extracting page URLs from: {page_url} (max {max_videos})")
 
-        if zip_path and os.path.exists(zip_path):
-            os.remove(zip_path)
-            print(f"✓ Deleted zip: {zip_path}")
-    except Exception as e:
-        print(f"Cleanup error: {e}")
-
-
-def extract_video_urls(page_url: str, max_videos: int) -> List[str]:
-    """Use yt-dlp to extract first N video URLs."""
-    print(f"→ Extracting URLs from: {page_url}")
-
-    opts = {
+    ydl_opts = {
         "quiet": True,
         "no_warnings": True,
         "extract_flat": True,
         "playlistend": max_videos,
         "retries": 3,
         "socket_timeout": 15,
+        "skip_download": True,
+        "cachedir": False,
     }
 
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(page_url, download=False)
-    except Exception as e:
-        print("✗ yt-dlp extraction failed:", e)
-        raise
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(page_url, download=False)
 
-    urls = []
+    urls: List[str] = []
+
     if "entries" in info and info["entries"]:
         for entry in info["entries"]:
-            if entry and "url" in entry:
+            if not entry:
+                continue
+            if "url" in entry:
+                # For flat playlist entries, 'url' is usually the page URL
                 urls.append(entry["url"])
-    elif "url" in info:
-        urls.append(info["url"])
+    else:
+        # Single video / non-playlist page
+        if "webpage_url" in info:
+            urls.append(info["webpage_url"])
+        elif "url" in info:
+            urls.append(info["url"])
 
-    print(f"✓ Found {len(urls)} videos")
+    print(f"✓ Found {len(urls)} page URLs")
     return urls[:max_videos]
 
 
-def download_video(video_url: str, output_path: str, idx: int) -> bool:
-    """Download 1 video using yt-dlp."""
-    print(f"→ Downloading video {idx}: {video_url}")
+def get_best_direct_video_url(video_page_url: str) -> Dict[str, Any]:
+    """
+    Given a Rumble video *page* URL, use yt-dlp to get the info dict and pick
+    a direct media URL (prefer MP4).
+    Returns a dict containing:
+      - 'direct_url'
+      - 'ext'
+      - 'id'
+      - 'title'
+      - 'duration'
+    """
+    print(f"→ Getting direct video URL for page: {video_page_url}")
 
-    opts = {
-        "format": "best[ext=mp4]/best",
-        "outtmpl": output_path,
+    ydl_opts = {
         "quiet": True,
         "no_warnings": True,
+        "skip_download": True,
+        "cachedir": False,
         "retries": 3,
-        "socket_timeout": 25,
+        "socket_timeout": 20,
     }
 
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([video_url])
-        return True
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(video_page_url, download=False)
 
-    except Exception as e:
-        print(f"✗ Download failed for video {idx}: {e}")
-        # remove partial files
-        for ext in ["", ".part", ".ytdl", ".temp", ".download"]:
-            if os.path.exists(output_path + ext):
-                os.remove(output_path + ext)
-        return False
+    # If the top-level info already has a direct URL and ext, use it
+    if "url" in info and info.get("ext"):
+        return {
+            "direct_url": info["url"],
+            "ext": info.get("ext", "mp4"),
+            "id": info.get("id"),
+            "title": info.get("title"),
+            "duration": info.get("duration"),
+        }
 
+    formats = info.get("formats") or []
+    if not formats:
+        raise RuntimeError("No formats found for video")
 
-def create_zip(src_dir: str, zip_path: str) -> int:
-    """Zip all MP4 files in the directory."""
-    count = 0
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-        for root, _, files in os.walk(src_dir):
-            for f in files:
-                file_path = os.path.join(root, f)
-                zipf.write(file_path, arcname=f)
-                count += 1
-    return count
+    # Prefer MP4 formats, choose highest resolution/bitrate
+    mp4_formats = [f for f in formats if f.get("ext") == "mp4" and f.get("url")]
+    candidate_formats = mp4_formats or [f for f in formats if f.get("url")]
 
+    if not candidate_formats:
+        raise RuntimeError("No usable formats with URLs found for video")
 
-def upload_to_r2(zip_path: str, key: str) -> str:
-    """Upload ZIP to R2 and return the public URL."""
-    print(f"→ Uploading ZIP to R2 with key: {key}")
+    def score(f):
+        # sort by (height, tbr) descending
+        h = f.get("height") or 0
+        tbr = f.get("tbr") or 0
+        return (h, tbr)
 
-    try:
-        s3_client.upload_file(zip_path, R2_BUCKET, key)
-    except Exception as e:
-        print("✗ R2 upload failed:", e)
-        raise
+    candidate_formats.sort(key=score, reverse=True)
+    best = candidate_formats[0]
 
-    public_url = f"{R2_PUBLIC_BASE_URL.rstrip('/')}/{key}"
-    print("✓ Uploaded. Public URL:", public_url)
-    return public_url
+    return {
+        "direct_url": best["url"],
+        "ext": best.get("ext", "mp4"),
+        "id": info.get("id"),
+        "title": info.get("title"),
+        "duration": info.get("duration"),
+    }
 
+# ============================================================
+#  R2 Streaming Helper
+# ============================================================
+
+def stream_video_to_r2(media_url: str, r2_key: str) -> None:
+    """
+    Stream a remote media URL directly into R2 without saving to disk.
+    """
+    print(f"→ Streaming to R2 key: {r2_key}")
+    with requests.get(media_url, stream=True, timeout=60) as resp:
+        resp.raise_for_status()
+        # resp.raw is a file-like object
+        s3_client.upload_fileobj(resp.raw, R2_BUCKET, r2_key)
+    print("✓ Upload to R2 completed")
+
+def build_public_r2_url(key: str) -> str:
+    return f"{R2_PUBLIC_BASE_URL.rstrip('/')}/{key.lstrip('/')}"
 
 # ============================================================
 #  ENDPOINTS
@@ -206,76 +217,101 @@ async def health():
 
 @app.post("/api/rumble-urls")
 async def api_rumble_urls(req: RumbleRequestWithLimit):
+    """
+    Lightweight helper: returns the first N video PAGE URLs from the Rumble listing.
+    """
     try:
-        urls = extract_video_urls(req.page_url, req.max_videos)
-        return {"count": len(urls), "video_urls": urls}
-    except Exception:
-        raise HTTPException(502, "Failed to extract video links")
-
-
-@app.post("/api/rumble-zip")
-async def api_rumble_zip(req: RumbleRequestWithLimit, bg: BackgroundTasks):
-
-    # mkdir safe temp directory inside /tmp
-    random_id = str(uuid.uuid4())
-    temp_dir = os.path.join(BASE_TMP_DIR, random_id)
-    zip_path = os.path.join(BASE_TMP_DIR, f"{random_id}.zip")
-    os.makedirs(temp_dir, exist_ok=True)
-
-    try:
-        # Extract
-        urls = extract_video_urls(req.page_url, req.max_videos)
+        urls = extract_page_video_urls(req.page_url, req.max_videos)
         if not urls:
+            raise HTTPException(400, "No video URLs found on page")
+        return {"count": len(urls), "video_page_urls": urls}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print("Error in /api/rumble-urls:", e)
+        raise HTTPException(502, "Failed to extract URLs from Rumble page")
+
+
+@app.post("/api/rumble-r2")
+async def api_rumble_r2(req: RumbleRequestWithLimit):
+    """
+    Main endpoint:
+      1) Extract first N (<=5) video *page* URLs from the given Rumble page.
+      2) For each page URL, get the best direct media URL via yt-dlp.
+      3) Stream each media URL directly into R2 (no local disk).
+      4) Return JSON with the list of R2 public URLs.
+    """
+    job_id = str(uuid.uuid4())
+    print("\n" + "=" * 60)
+    print("📥 New R2 job")
+    print(f"   Job ID: {job_id}")
+    print(f"   Page URL: {req.page_url}")
+    print(f"   Max videos: {req.max_videos}")
+    print("=" * 60)
+
+    try:
+        page_urls = extract_page_video_urls(req.page_url, req.max_videos)
+        if not page_urls:
             raise HTTPException(400, "No videos found on page")
 
-        # Download
-        success = 0
-        for i, url in enumerate(urls, 1):
-            out_path = os.path.join(temp_dir, f"video{i:02d}.mp4")
-            if download_video(url, out_path, i):
-                success += 1
+        results = []
+        for idx, page_url in enumerate(page_urls, 1):
+            entry: Dict[str, Any] = {
+                "index": idx,
+                "page_url": page_url,
+                "success": False,
+                "error": None,
+                "r2_key": None,
+                "r2_url": None,
+                "duration": None,
+                "title": None,
+            }
+            try:
+                info = get_best_direct_video_url(page_url)
+                media_url = info["direct_url"]
+                ext = info.get("ext", "mp4") or "mp4"
+                vid_id = info.get("id") or f"video{idx:02d}"
 
-        if success == 0:
-            raise HTTPException(500, "Could not download any videos")
+                r2_key = f"rumble_streams/{job_id}/{vid_id}.{ext}"
+                stream_video_to_r2(media_url, r2_key)
+                r2_url = build_public_r2_url(r2_key)
 
-        # Zip
-        count = create_zip(temp_dir, zip_path)
-        size_mb = os.path.getsize(zip_path) / (1024 * 1024)
+                entry["success"] = True
+                entry["r2_key"] = r2_key
+                entry["r2_url"] = r2_url
+                entry["duration"] = info.get("duration")
+                entry["title"] = info.get("title")
+            except Exception as e:
+                print(f"✗ Failed to process video {idx}: {e}")
+                entry["error"] = str(e)
 
-        # Upload to R2
-        r2_key = f"rumble_zips/{random_id}.zip"
-        download_url = upload_to_r2(zip_path, r2_key)
+            results.append(entry)
 
-        # Cleanup local files async
-        bg.add_task(cleanup_temp_files, temp_dir, zip_path)
+        ok_count = sum(1 for r in results if r["success"])
+        print(f"✓ Job {job_id} finished: {ok_count}/{len(results)} uploads succeeded")
+
+        if ok_count == 0:
+            raise HTTPException(502, "Failed to upload any videos to R2")
 
         return JSONResponse(
             {
-                "job_id": random_id,
+                "job_id": job_id,
                 "page_url": req.page_url,
-                "file_count": count,
-                "zip_size_mb": round(size_mb, 2),
-                "download_url": download_url,
-                "status": "ready",
+                "max_videos": req.max_videos,
+                "success_count": ok_count,
+                "total": len(results),
+                "entries": results,
             }
         )
 
     except HTTPException:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        if os.path.exists(zip_path):
-            os.remove(zip_path)
         raise
-
     except Exception as e:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        if os.path.exists(zip_path):
-            os.remove(zip_path)
-        print("Unexpected error:", e)
+        print("Unexpected error in /api/rumble-r2:", e)
         raise HTTPException(500, f"Internal error: {e}")
 
-
 # ============================================================
-#  LOCAL DEV SERVER (ignored by Vercel runtime)
+#  LOCAL DEV SERVER (ignored by Vercel)
 # ============================================================
 if __name__ == "__main__":
     import uvicorn
