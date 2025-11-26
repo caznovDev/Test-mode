@@ -13,7 +13,7 @@ from typing import List, Dict, Any
 #  FASTAPI + CORS
 # ============================================================
 
-app = FastAPI(title="Rumble → R2 Streamer API")
+app = FastAPI(title="Rumble → R2 Streamer API (with paging)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -68,34 +68,42 @@ class RumbleRequest(BaseModel):
 
 
 class RumbleRequestWithLimit(RumbleRequest):
-    # Default small to stay well inside Vercel time limits & no disk use
+    # page size
     max_videos: int = 3
+    # 1-based page index
+    page: int = 1
 
     @field_validator("max_videos")
     def validate_limit(cls, v: int) -> int:
         if v < 1:
             raise ValueError("max_videos must be at least 1")
-        # Streaming multiple videos still takes time; keep this conservative
+        # Keep it conservative for Vercel time limits
         if v > 5:
             raise ValueError("max_videos must be <= 5 on this deployment")
+        return v
+
+    @field_validator("page")
+    def validate_page(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("page must be >= 1")
         return v
 
 # ============================================================
 #  yt-dlp Helpers (no download, no cache)
 # ============================================================
 
-def extract_page_video_urls(page_url: str, max_videos: int) -> List[str]:
+def extract_page_video_urls(page_url: str, total_needed: int) -> List[str]:
     """
-    Use yt-dlp in 'flat' mode to get the first N *page* URLs from a Rumble
-    listing page (user/videos, playlist, etc.).
+    Use yt-dlp in 'flat' mode to get up to total_needed video PAGE URLs
+    from a Rumble listing page (user/videos, playlist, etc.).
     """
-    print(f"→ Extracting page URLs from: {page_url} (max {max_videos})")
+    print(f"→ Extracting up to {total_needed} page URLs from: {page_url}")
 
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
         "extract_flat": True,
-        "playlistend": max_videos,
+        "playlistend": total_needed,
         "retries": 3,
         "socket_timeout": 15,
         "skip_download": True,
@@ -112,7 +120,6 @@ def extract_page_video_urls(page_url: str, max_videos: int) -> List[str]:
             if not entry:
                 continue
             if "url" in entry:
-                # For flat playlist entries, 'url' is usually the page URL
                 urls.append(entry["url"])
     else:
         # Single video / non-playlist page
@@ -121,20 +128,20 @@ def extract_page_video_urls(page_url: str, max_videos: int) -> List[str]:
         elif "url" in info:
             urls.append(info["url"])
 
-    print(f"✓ Found {len(urls)} page URLs")
-    return urls[:max_videos]
+    print(f"✓ Found {len(urls)} total page URLs")
+    return urls[:total_needed]
 
 
 def get_best_direct_video_url(video_page_url: str) -> Dict[str, Any]:
     """
     Given a Rumble video *page* URL, use yt-dlp to get the info dict and pick
     a direct media URL (prefer MP4).
-    Returns a dict containing:
-      - 'direct_url'
-      - 'ext'
-      - 'id'
-      - 'title'
-      - 'duration'
+    Returns:
+      - direct_url
+      - ext
+      - id
+      - title
+      - duration
     """
     print(f"→ Getting direct video URL for page: {video_page_url}")
 
@@ -150,7 +157,7 @@ def get_best_direct_video_url(video_page_url: str) -> Dict[str, Any]:
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(video_page_url, download=False)
 
-    # If the top-level info already has a direct URL and ext, use it
+    # If top-level info already has a direct URL + ext, use it
     if "url" in info and info.get("ext"):
         return {
             "direct_url": info["url"],
@@ -164,7 +171,7 @@ def get_best_direct_video_url(video_page_url: str) -> Dict[str, Any]:
     if not formats:
         raise RuntimeError("No formats found for video")
 
-    # Prefer MP4 formats, choose highest resolution/bitrate
+    # Prefer MP4
     mp4_formats = [f for f in formats if f.get("ext") == "mp4" and f.get("url")]
     candidate_formats = mp4_formats or [f for f in formats if f.get("url")]
 
@@ -172,7 +179,6 @@ def get_best_direct_video_url(video_page_url: str) -> Dict[str, Any]:
         raise RuntimeError("No usable formats with URLs found for video")
 
     def score(f):
-        # sort by (height, tbr) descending
         h = f.get("height") or 0
         tbr = f.get("tbr") or 0
         return (h, tbr)
@@ -189,7 +195,7 @@ def get_best_direct_video_url(video_page_url: str) -> Dict[str, Any]:
     }
 
 # ============================================================
-#  R2 Streaming Helper
+#  R2 Streaming Helpers
 # ============================================================
 
 def stream_video_to_r2(media_url: str, r2_key: str) -> None:
@@ -199,9 +205,9 @@ def stream_video_to_r2(media_url: str, r2_key: str) -> None:
     print(f"→ Streaming to R2 key: {r2_key}")
     with requests.get(media_url, stream=True, timeout=60) as resp:
         resp.raise_for_status()
-        # resp.raw is a file-like object
         s3_client.upload_fileobj(resp.raw, R2_BUCKET, r2_key)
     print("✓ Upload to R2 completed")
+
 
 def build_public_r2_url(key: str) -> str:
     return f"{R2_PUBLIC_BASE_URL.rstrip('/')}/{key.lstrip('/')}"
@@ -218,13 +224,39 @@ async def health():
 @app.post("/api/rumble-urls")
 async def api_rumble_urls(req: RumbleRequestWithLimit):
     """
-    Lightweight helper: returns the first N video PAGE URLs from the Rumble listing.
+    Paging logic:
+      - We ask yt-dlp for up to (page * max_videos) URLs.
+      - Then we slice the list to return only that page.
+
+    Example:
+      max_videos = 3
+      page = 1 → items 0..2  (videos 1,2,3)
+      page = 2 → items 3..5  (videos 4,5,6)
     """
+    page_size = req.max_videos
+    total_needed = req.page * page_size
+    print(
+        f"→ /api/rumble-urls: page={req.page}, page_size={page_size}, "
+        f"total_needed={total_needed}"
+    )
+
     try:
-        urls = extract_page_video_urls(req.page_url, req.max_videos)
-        if not urls:
-            raise HTTPException(400, "No video URLs found on page")
-        return {"count": len(urls), "video_page_urls": urls}
+        all_urls = extract_page_video_urls(req.page_url, total_needed)
+        start = (req.page - 1) * page_size
+        end = start + page_size
+        page_urls = all_urls[start:end]
+
+        if not page_urls:
+            raise HTTPException(400, "No videos found for this page")
+
+        return {
+            "page_url": req.page_url,
+            "page": req.page,
+            "page_size": page_size,
+            "total_extracted": len(all_urls),
+            "returned": len(page_urls),
+            "video_page_urls": page_urls,
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -235,29 +267,45 @@ async def api_rumble_urls(req: RumbleRequestWithLimit):
 @app.post("/api/rumble-r2")
 async def api_rumble_r2(req: RumbleRequestWithLimit):
     """
-    Main endpoint:
-      1) Extract first N (<=5) video *page* URLs from the given Rumble page.
-      2) For each page URL, get the best direct media URL via yt-dlp.
-      3) Stream each media URL directly into R2 (no local disk).
-      4) Return JSON with the list of R2 public URLs.
+    Paging + streaming:
+      1) Extract up to (page * max_videos) video PAGE URLs.
+      2) Slice to get only that page's URLs.
+      3) For each, get direct media URL via yt-dlp.
+      4) Stream to R2 under a job-specific prefix.
+      5) Return R2 public URLs + metadata.
+
+    You can call:
+      page=1 → videos 1..max_videos
+      page=2 → videos (max_videos+1)..(2*max_videos)
+      etc.
     """
     job_id = str(uuid.uuid4())
+    page_size = req.max_videos
+    total_needed = req.page * page_size
+
     print("\n" + "=" * 60)
-    print("📥 New R2 job")
+    print("📥 New R2 paging job")
     print(f"   Job ID: {job_id}")
     print(f"   Page URL: {req.page_url}")
-    print(f"   Max videos: {req.max_videos}")
+    print(f"   Page: {req.page}")
+    print(f"   Page size (max_videos): {page_size}")
+    print(f"   Total needed from yt-dlp: {total_needed}")
     print("=" * 60)
 
     try:
-        page_urls = extract_page_video_urls(req.page_url, req.max_videos)
+        all_urls = extract_page_video_urls(req.page_url, total_needed)
+        start = (req.page - 1) * page_size
+        end = start + page_size
+        page_urls = all_urls[start:end]
+
         if not page_urls:
-            raise HTTPException(400, "No videos found on page")
+            raise HTTPException(400, "No videos found for this page")
 
         results = []
-        for idx, page_url in enumerate(page_urls, 1):
+        for idx, page_url in enumerate(page_urls, start=start + 1):
             entry: Dict[str, Any] = {
-                "index": idx,
+                "index_global": idx,            # position in listing (1-based)
+                "index_page": idx - start,      # 1..page_size within this page
                 "page_url": page_url,
                 "success": False,
                 "error": None,
@@ -272,7 +320,7 @@ async def api_rumble_r2(req: RumbleRequestWithLimit):
                 ext = info.get("ext", "mp4") or "mp4"
                 vid_id = info.get("id") or f"video{idx:02d}"
 
-                r2_key = f"rumble_streams/{job_id}/{vid_id}.{ext}"
+                r2_key = f"rumble_streams/{job_id}/p{req.page}_{vid_id}.{ext}"
                 stream_video_to_r2(media_url, r2_key)
                 r2_url = build_public_r2_url(r2_key)
 
@@ -282,24 +330,28 @@ async def api_rumble_r2(req: RumbleRequestWithLimit):
                 entry["duration"] = info.get("duration")
                 entry["title"] = info.get("title")
             except Exception as e:
-                print(f"✗ Failed to process video {idx}: {e}")
+                print(f"✗ Failed to process video #{idx}: {e}")
                 entry["error"] = str(e)
 
             results.append(entry)
 
         ok_count = sum(1 for r in results if r["success"])
-        print(f"✓ Job {job_id} finished: {ok_count}/{len(results)} uploads succeeded")
+        print(
+            f"✓ Job {job_id} finished for page {req.page}: "
+            f"{ok_count}/{len(results)} uploads succeeded"
+        )
 
         if ok_count == 0:
-            raise HTTPException(502, "Failed to upload any videos to R2")
+            raise HTTPException(502, "Failed to upload any videos to R2 for this page")
 
         return JSONResponse(
             {
                 "job_id": job_id,
                 "page_url": req.page_url,
-                "max_videos": req.max_videos,
+                "page": req.page,
+                "page_size": page_size,
                 "success_count": ok_count,
-                "total": len(results),
+                "total_in_page": len(results),
                 "entries": results,
             }
         )
