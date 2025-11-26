@@ -1,10 +1,5 @@
-yt-dlp==0.109.0
-uvicorn[standard]==0.27.0
-yt-dlp==2024.3.10
-python-multipart==0.0.9
 fastapi
-python-multipart
-uvicorn[standard]
-yyt-dlp
+uvicorn
+yt-dlp
 boto3
 pydantic
